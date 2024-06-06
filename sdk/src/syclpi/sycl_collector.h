@@ -39,6 +39,7 @@ class GlobalSyclInitializer {
     utils::SetEnv("XPTI_SUBSCRIBERS", utils::GetPathToSharedObject(Initialize).c_str());
     utils::SetEnv("XPTI_FRAMEWORK_DISPATCHER", utils::GetPathToSharedObject(xptiReset).c_str());
     utils::SetEnv("XPTI_TRACE_ENABLE", "1");
+    utils::SetEnv("UR_ENABLE_LAYERS", "UR_LAYER_TRACING");
     return true;
   }
 
@@ -75,14 +76,14 @@ thread_local std::map<uint64_t, std::unique_ptr<sycl_node_t>> s_node_map = {};
 #endif
 
 thread_local std::map<uint64_t, uint64_t> node_q_map = {};
-struct SyclPiFuncT {
+struct SyclUrFuncT {
   std::array<char, kMaxFuncNameLen> func_name;
   uint32_t func_pid;
   uint32_t func_tid;
 };
 
 inline thread_local bool framework_finalized = false;
-inline thread_local SyclPiFuncT current_func_task_info;
+inline thread_local SyclUrFuncT current_func_task_info;
 
 inline constexpr static std::array<const char* const, 13> kSTraceType = {
     "TaskBegin",           "TaskEnd",     "Signal",    "NodeCreate", "FunctionWithArgsBegin",
@@ -192,7 +193,7 @@ class SyclCollector {
                  tid, Name.c_str());
 
     switch (trace_type) {
-      case xpti::trace_point_type_t::function_begin:
+      case xpti::trace_point_type_t::function_with_args_begin:
         // Until the user calls EnableTracing(), disable tracing when we are
         // able to capture the sycl runtime streams sycl and sycl.pi
         // Empirically, we found the sycl.pi stream gets emitted after the sycl
@@ -207,8 +208,9 @@ class SyclCollector {
         sycl_data_mview.cid_ = sycl_data_kview.cid_;
 
         if (UserData) {
-          const auto* function_name = static_cast<const char*>(UserData);
-          SPDLOG_TRACE("\tSYCL.PI Function Begin: {}", function_name);
+          auto* Args = static_cast<const xpti::function_with_args_t*>(UserData);
+          const auto* function_name = Args->function_name;
+          SPDLOG_TRACE("\tSYCL.UR Function Begin: {}", function_name);
           if ((strlen(function_name) + 1) < kMaxFuncNameLen) {
             strcpy(current_func_task_info.func_name.data(), function_name);
           } else {
@@ -216,11 +218,11 @@ class SyclCollector {
           }
           current_func_task_info.func_pid = pid;
           current_func_task_info.func_tid = tid;
-          if (strcmp(function_name, "piEnqueueKernelLaunch") == 0) {
+          if (strcmp(function_name, "urEnqueueKernelLaunch") == 0) {
             sycl_data_kview.sycl_enqk_begin_time_ = Time;
           }
-          if ((strcmp(function_name, "piextUSMEnqueueMemcpy") == 0) ||
-              (strcmp(function_name, "piextUSMEnqueueMemcpy2d") == 0)) {
+          if ((strcmp(function_name, "urEnqueueUSMMemcpy") == 0) ||
+              (strcmp(function_name, "urEnqueueUSMMemcpy2D") == 0)) {
             sycl_data_mview.sycl_task_begin_time_ = Time;
           }
           SyclCollector::Instance().sycl_runtime_rec_.pid_ = pid;
@@ -229,10 +231,11 @@ class SyclCollector {
           SyclCollector::Instance().sycl_runtime_rec_.sycl_func_name_ = function_name;
         }
         break;
-      case xpti::trace_point_type_t::function_end:
+      case xpti::trace_point_type_t::function_with_args_end:
         if (UserData) {
-          const auto* function_name = static_cast<const char*>(UserData);
-          SPDLOG_TRACE("\tSYCL.PI Function End: {}", function_name);
+          auto* Args = static_cast<const xpti::function_with_args_t*>(UserData);
+          const auto* function_name = Args->function_name;
+          SPDLOG_TRACE("\tSYCL.UR Function End: {}", function_name);
           PTI_ASSERT(strcmp(current_func_task_info.func_name.data(), function_name) == 0);
           PTI_ASSERT(current_func_task_info.func_pid == pid);
           PTI_ASSERT(current_func_task_info.func_tid == tid);
@@ -240,15 +243,15 @@ class SyclCollector {
                        current_func_task_info.func_name.data(), current_func_task_info.func_pid,
                        current_func_task_info.func_tid);
           SyclCollector::Instance().sycl_runtime_rec_.cid_ = sycl_data_kview.cid_;
-          if (strcmp(function_name, "piEnqueueKernelLaunch") == 0) {
+          if (strcmp(function_name, "urEnqueueKernelLaunch") == 0) {
             SyclCollector::Instance().sycl_runtime_rec_.kid_ = sycl_data_kview.kid_;
             SyclCollector::Instance().sycl_runtime_rec_.sycl_queue_id_ =
                 sycl_data_kview.sycl_queue_id_;
           }
-          if ((strcmp(function_name, "piextUSMEnqueueMemcpy") == 0) ||
-              (strcmp(function_name, "piextUSMEnqueueMemcpy2d") == 0) ||
-              (strcmp(function_name, "piEnqueueMemBufferRead") == 0) ||
-              (strcmp(function_name, "piEnqueueMemBufferWrite") == 0)) {
+          if ((strcmp(function_name, "urEnqueueUSMMemcpy") == 0) ||
+              (strcmp(function_name, "urEnqueueUSMMemcpy2D") == 0) ||
+              (strcmp(function_name, "urEnqueueMemBufferRead") == 0) ||
+              (strcmp(function_name, "urEnqueueMemBufferWrite") == 0)) {
             SyclCollector::Instance().sycl_runtime_rec_.kid_ = sycl_data_mview.kid_;
             SyclCollector::Instance().sycl_runtime_rec_.tid_ = sycl_data_mview.tid_;
             SyclCollector::Instance().sycl_runtime_rec_.sycl_queue_id_ =
@@ -423,11 +426,13 @@ XPTI_CALLBACK_API void xptiTraceInit(unsigned int /*major_version*/, unsigned in
     xptiRegisterCallback(stream_id, static_cast<uint16_t>(xpti::trace_point_type_t::metadata),
                          SyclCollector::TpCallback);
     SPDLOG_DEBUG("Registered callbacks for {}", stream_name);
-  } else if (strcmp(stream_name, "sycl.pi") == 0) {
+  } else if (strcmp(stream_name, "ur") == 0) {
     stream_id = xptiRegisterStream(stream_name);
-    xptiRegisterCallback(stream_id, static_cast<uint16_t>(xpti::trace_point_type_t::function_begin),
+    xptiRegisterCallback(stream_id,
+                         static_cast<uint16_t>(xpti::trace_point_type_t::function_with_args_begin),
                          SyclCollector::TpCallback);
-    xptiRegisterCallback(stream_id, static_cast<uint16_t>(xpti::trace_point_type_t::function_end),
+    xptiRegisterCallback(stream_id,
+                         static_cast<uint16_t>(xpti::trace_point_type_t::function__with_args_end),
                          SyclCollector::TpCallback);
     xptiRegisterCallback(stream_id, static_cast<uint16_t>(xpti::trace_point_type_t::metadata),
                          SyclCollector::TpCallback);

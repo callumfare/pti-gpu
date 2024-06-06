@@ -273,7 +273,7 @@ class MainFixtureTest : public ::testing::Test {
         }
         case pti_view_kind::PTI_VIEW_SYCL_RUNTIME_CALLS: {
           std::string function_name = reinterpret_cast<pti_view_record_sycl_runtime*>(ptr)->_name;
-          if (function_name.find("piEnqueueKernelLaunch") != std::string::npos) {
+          if (function_name.find("urEnqueueKernelLaunch") != std::string::npos) {
             kernel_launch_func_name = true;
           }
           break;
